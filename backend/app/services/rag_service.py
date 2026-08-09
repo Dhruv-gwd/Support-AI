@@ -3,7 +3,7 @@ from app.services.vector_store_service import VectorStoreService
 from app.services.gemini_service import GeminiService
 from app.services.image_store import get_document_images
 
-TOP_K = 4
+TOP_K = 8
 
 
 def build_prompt(context: str, question: str, history: list[dict] | None = None) -> str:
@@ -42,9 +42,17 @@ class RagService:
         self.vector_store = VectorStoreService()
         self.gemini_service = GeminiService()
 
-    def answer(self, question: str, tenant_id: int, top_k: int = TOP_K, history: list[dict] | None = None) -> tuple[str, list[str], list[str]]:
+    def answer(
+        self,
+        question: str,
+        tenant_id: int,
+        top_k: int = TOP_K,
+        history: list[dict] | None = None,
+    ) -> tuple[str, list[str], list[str]]:
         query_embedding = self.embedding_service.embed_query(question)
-        results = self.vector_store.query(query_embedding, top_k=top_k, tenant_id=tenant_id)
+        results = self.vector_store.query(
+            query_embedding, top_k=top_k, tenant_id=tenant_id
+        )
 
         retrieved_chunks = results["documents"][0] if results["documents"] else []
         metadatas = results["metadatas"][0] if results["metadatas"] else []
