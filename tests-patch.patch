@@ -1,0 +1,458 @@
+diff --git a/backend/requirements-dev.txt b/backend/requirements-dev.txt
+new file mode 100644
+index 0000000..152b054
+--- /dev/null
++++ b/backend/requirements-dev.txt
+@@ -0,0 +1,2 @@
++-r requirements.txt
++pytest==8.3.4
+diff --git a/backend/tests/conftest.py b/backend/tests/conftest.py
+new file mode 100644
+index 0000000..80e7c37
+--- /dev/null
++++ b/backend/tests/conftest.py
+@@ -0,0 +1,119 @@
++"""
++Shared pytest fixtures.
++
++These tests never talk to a real Ollama server or a real, shared Chroma
++store: they set SECRET_KEY / DATABASE_PATH to throwaway values *before*
++the app is imported, and monkeypatch the embedding + vector-store calls so
++`pytest` runs in seconds with no Docker services running. That's a
++deliberate trade-off — it means these tests won't catch an actual Ollama
++integration break, only the application logic around auth, uploads, and
++tenant isolation. Catching real Ollama failures is what the manual
++clean-machine rebuild test (docker compose up --build) is for.
++"""
++import os
++import sys
++import tempfile
++from pathlib import Path
++
++import pytest
++
++# --- Set required env vars BEFORE importing anything from the app ---
++# app/config.py raises at import time if SECRET_KEY is missing, and
++# app/models/database.py picks its SQLite file from DATABASE_PATH at
++# import time too. Both must be set first.
++_TEST_DB_DIR = tempfile.mkdtemp(prefix="supportai_test_db_")
++os.environ["SECRET_KEY"] = "test-secret-key-not-for-production-use-only-in-tests"
++os.environ["DATABASE_PATH"] = str(Path(_TEST_DB_DIR) / "test.db")
++os.environ.setdefault("RATE_LIMIT_PER_MINUTE", "1000")  # tests fire many requests fast
++
++BACKEND_ROOT = Path(__file__).resolve().parents[1]
++if str(BACKEND_ROOT) not in sys.path:
++    sys.path.insert(0, str(BACKEND_ROOT))
++
++from fastapi.testclient import TestClient  # noqa: E402
++
++from app.main import app  # noqa: E402
++from app.models.database import Base, engine, SessionLocal  # noqa: E402
++import app.api.documents as documents_module  # noqa: E402
++from app.services.vector_store_service import VectorStoreService  # noqa: E402
++
++
++@pytest.fixture(autouse=True)
++def _fresh_database():
++    """Wipe and recreate every table before each test, so tests never leak
++    state into each other (e.g. one test's user shouldn't affect another
++    test's "am I the first user" tenant-bootstrap check)."""
++    Base.metadata.drop_all(bind=engine)
++    Base.metadata.create_all(bind=engine)
++    yield
++
++
++@pytest.fixture(autouse=True)
++def _isolated_image_map(tmp_path, monkeypatch):
++    """Point image_store's on-disk image_map.json at a temp file instead
++    of the real backend/app/images/image_map.json, so running tests never
++    mutates real application data."""
++    import app.services.image_store as image_store_module
++
++    fake_map_path = tmp_path / "image_map_test.json"
++    monkeypatch.setattr(image_store_module, "IMAGE_MAP_PATH", fake_map_path)
++    yield
++
++
++@pytest.fixture(autouse=True)
++def _isolated_vector_store(tmp_path, monkeypatch):
++    """Point the module-level vector_store singleton at a fresh temp
++    directory per test, instead of the real backend/chroma_data folder,
++    so tests can't pollute or depend on real uploaded data."""
++    test_store = VectorStoreService(persist_directory=str(tmp_path / "chroma_test"))
++    monkeypatch.setattr(documents_module, "vector_store", test_store)
++    yield test_store
++
++
++@pytest.fixture(autouse=True)
++def _fake_embeddings(monkeypatch):
++    """Replace real Ollama embedding calls with a cheap deterministic fake.
++    No Ollama server is running in the test environment, and we don't need
++    real embedding quality to test upload/dedup/tenant-isolation logic —
++    we just need *some* fixed-length vector per chunk."""
++
++    def fake_embed_documents(self, texts):
++        return [[0.1, 0.2, 0.3, 0.4] for _ in texts]
++
++    def fake_embed_query(self, text):
++        return [0.1, 0.2, 0.3, 0.4]
++
++    monkeypatch.setattr(
++        documents_module.EmbeddingService, "embed_documents", fake_embed_documents
++    )
++    monkeypatch.setattr(
++        documents_module.EmbeddingService, "embed_query", fake_embed_query
++    )
++
++
++@pytest.fixture
++def client():
++    return TestClient(app)
++
++
++@pytest.fixture
++def db_session():
++    session = SessionLocal()
++    try:
++        yield session
++    finally:
++        session.close()
++
++
++def register(client, email="admin@example.com", password="correct-horse-battery", name="Test Admin"):
++    """Register a user and return (response, access_token)."""
++    resp = client.post(
++        "/api/auth/register",
++        json={"email": email, "password": password, "full_name": name},
++    )
++    token = resp.json().get("access_token") if resp.status_code == 201 else None
++    return resp, token
++
++
++def auth_headers(token):
++    return {"Authorization": f"Bearer {token}"}
+diff --git a/backend/tests/test_admin.py b/backend/tests/test_admin.py
+new file mode 100644
+index 0000000..0059855
+--- /dev/null
++++ b/backend/tests/test_admin.py
+@@ -0,0 +1,57 @@
++"""Admin-only routes must reject regular users, not just unauthenticated ones."""
++from conftest import register, auth_headers
++
++
++def _admin_and_user_tokens(client):
++    _, admin_token = register(client, email="boss@example.com")
++    _, user_token = register(client, email="employee@example.com")
++    return admin_token, user_token
++
++
++def test_admin_users_list_rejects_regular_user(client):
++    _, user_token = _admin_and_user_tokens(client)
++    resp = client.get("/api/admin/users", headers=auth_headers(user_token))
++    assert resp.status_code == 403
++
++
++def test_admin_users_list_allows_admin(client):
++    admin_token, _ = _admin_and_user_tokens(client)
++    resp = client.get("/api/admin/users", headers=auth_headers(admin_token))
++    assert resp.status_code == 200
++
++
++def test_admin_settings_rejects_regular_user(client):
++    _, user_token = _admin_and_user_tokens(client)
++    resp = client.get("/api/admin/settings", headers=auth_headers(user_token))
++    assert resp.status_code == 403
++
++
++def test_admin_settings_allows_admin_and_has_expected_fields(client):
++    admin_token, _ = _admin_and_user_tokens(client)
++    resp = client.get("/api/admin/settings", headers=auth_headers(admin_token))
++    assert resp.status_code == 200
++    body = resp.json()
++    for field in (
++        "tenant_name",
++        "tenant_slug",
++        "rate_limit_per_minute",
++        "max_file_size_mb",
++        "access_token_expire_minutes",
++    ):
++        assert field in body
++
++
++def test_document_upload_rejects_regular_user(client):
++    _, user_token = _admin_and_user_tokens(client)
++    resp = client.post(
++        "/api/documents/upload",
++        headers=auth_headers(user_token),
++        files={"file": ("notes.txt", b"hello world", "text/plain")},
++    )
++    assert resp.status_code == 403
++
++
++def test_document_list_rejects_regular_user(client):
++    _, user_token = _admin_and_user_tokens(client)
++    resp = client.get("/api/documents", headers=auth_headers(user_token))
++    assert resp.status_code == 403
+diff --git a/backend/tests/test_auth.py b/backend/tests/test_auth.py
+new file mode 100644
+index 0000000..e790053
+--- /dev/null
++++ b/backend/tests/test_auth.py
+@@ -0,0 +1,109 @@
++"""
++Auth, registration, and single-tenant bootstrap.
++
++Covers the exact bug we hit manually this session: every signup used to
++create its own tenant and become admin of it. These tests pin down the
++fixed behavior so a future change can't silently reintroduce it.
++"""
++from conftest import register, auth_headers
++
++
++def test_register_returns_a_usable_token(client):
++    resp, token = register(client)
++    assert resp.status_code == 201
++    assert token
++
++    me = client.get("/api/auth/me", headers=auth_headers(token))
++    assert me.status_code == 200
++    assert me.json()["email"] == "admin@example.com"
++
++
++def test_first_user_ever_becomes_admin(client):
++    resp, token = register(client, email="first@example.com")
++    assert resp.status_code == 201
++
++    me = client.get("/api/auth/me", headers=auth_headers(token))
++    assert me.json()["role"] == "admin"
++
++
++def test_second_user_joins_as_plain_user_not_a_new_admin(client):
++    """This is the regression test for the bug we found manually: a
++    second signup must NOT get its own tenant or admin rights."""
++    register(client, email="first@example.com")
++    resp2, token2 = register(client, email="second@example.com")
++    assert resp2.status_code == 201
++
++    me2 = client.get("/api/auth/me", headers=auth_headers(token2))
++    assert me2.json()["role"] == "user"
++
++
++def test_second_user_shares_the_same_tenant_as_the_first(client):
++    _, token1 = register(client, email="first@example.com")
++    _, token2 = register(client, email="second@example.com")
++
++    admin_only = client.get(
++        "/api/admin/users", headers=auth_headers(token1)
++    )
++    assert admin_only.status_code == 200
++    emails = {u["email"] for u in admin_only.json()}
++    # Both users should be visible to the admin, because they're in the
++    # same workspace — proves they weren't split into separate tenants.
++    assert emails == {"first@example.com", "second@example.com"}
++
++
++def test_duplicate_email_registration_is_rejected(client):
++    register(client, email="dupe@example.com")
++    resp, _ = register(client, email="dupe@example.com")
++    assert resp.status_code == 400
++
++
++def test_password_too_short_is_rejected(client):
++    resp = client.post(
++        "/api/auth/register",
++        json={"email": "short@example.com", "password": "short", "full_name": "X"},
++    )
++    assert resp.status_code == 422
++
++
++def test_login_with_correct_credentials_succeeds(client):
++    register(client, email="login@example.com", password="correct-horse-battery")
++    resp = client.post(
++        "/api/auth/login",
++        json={"email": "login@example.com", "password": "correct-horse-battery"},
++    )
++    assert resp.status_code == 200
++    assert resp.json().get("access_token")
++
++
++def test_login_with_wrong_password_fails(client):
++    register(client, email="login2@example.com", password="correct-horse-battery")
++    resp = client.post(
++        "/api/auth/login",
++        json={"email": "login2@example.com", "password": "totally-wrong-password"},
++    )
++    assert resp.status_code == 401
++
++
++def test_login_with_unknown_email_fails(client):
++    resp = client.post(
++        "/api/auth/login",
++        json={"email": "nobody@example.com", "password": "whatever-password-here"},
++    )
++    assert resp.status_code == 401
++
++
++def test_protected_route_without_token_is_rejected(client):
++    resp = client.get("/api/auth/me")
++    assert resp.status_code == 401
++
++
++def test_protected_route_with_garbage_token_is_rejected(client):
++    resp = client.get(
++        "/api/auth/me", headers={"Authorization": "Bearer not-a-real-token"}
++    )
++    assert resp.status_code == 401
++
++
++def test_protected_route_with_malformed_auth_header_is_rejected(client):
++    resp = client.get("/api/auth/me", headers={"Authorization": "not-even-bearer-format"})
++    assert resp.status_code == 401
+diff --git a/backend/tests/test_documents.py b/backend/tests/test_documents.py
+new file mode 100644
+index 0000000..b473e65
+--- /dev/null
++++ b/backend/tests/test_documents.py
+@@ -0,0 +1,141 @@
++"""
++Upload dedup and cross-tenant isolation.
++
++Note on tenant isolation: registration is now single-tenant-per-deployment
++by design (see test_auth.py), so the API itself won't create a second
++tenant for us to test against. To exercise the isolation *mechanism*
++(tenant_id filtering in the vector store + image store) we build a second
++tenant directly in the DB here, the way a multi-instance/manual-migration
++scenario would. This still proves the underlying guarantee holds even
++though the register endpoint no longer exposes a way to trigger it.
++"""
++from app.models.database import Tenant, User
++from app.services.auth_service import create_access_token, get_password_hash
++
++from conftest import register, auth_headers
++
++
++def test_uploading_same_filename_twice_replaces_not_duplicates(client):
++    _, admin_token = register(client, email="admin@example.com")
++    headers = auth_headers(admin_token)
++
++    resp1 = client.post(
++        "/api/documents/upload",
++        headers=headers,
++        files={"file": ("policy.txt", b"Version one of the policy.", "text/plain")},
++    )
++    assert resp1.status_code == 200
++    assert resp1.json()["chunks_added"] >= 1
++
++    resp2 = client.post(
++        "/api/documents/upload",
++        headers=headers,
++        files={"file": ("policy.txt", b"Version two of the policy, much longer text this time around.", "text/plain")},
++    )
++    assert resp2.status_code == 200
++
++    listed = client.get("/api/documents", headers=headers)
++    sources = listed.json()["sources"]
++    # The real bug this guards against: uploading the same filename twice
++    # used to leave BOTH old and new chunks in the vector store. There
++    # should be exactly one entry for "policy.txt", not chunks from both
++    # versions coexisting.
++    assert sources.count("policy.txt") == 1
++
++
++def test_upload_rejects_disallowed_file_type(client):
++    _, admin_token = register(client, email="admin@example.com")
++    resp = client.post(
++        "/api/documents/upload",
++        headers=auth_headers(admin_token),
++        files={"file": ("virus.exe", b"not a real document", "application/octet-stream")},
++    )
++    assert resp.status_code == 400
++
++
++def _create_tenant_with_admin(db_session, email, tenant_name):
++    """Directly create a second, isolated tenant + admin user, bypassing
++    the (now intentionally single-tenant) /register endpoint."""
++    tenant = Tenant(name=tenant_name, slug=tenant_name.lower().replace(" ", "-"))
++    db_session.add(tenant)
++    db_session.flush()
++
++    user = User(
++        email=email,
++        hashed_password=get_password_hash("some-long-enough-password"),
++        full_name="Tenant Admin",
++        role="admin",
++        tenant_id=tenant.id,
++    )
++    db_session.add(user)
++    db_session.commit()
++    db_session.refresh(user)
++
++    token = create_access_token({"sub": str(user.id)})
++    return tenant, user, token
++
++
++def test_tenant_b_cannot_see_tenant_as_documents(client, db_session):
++    _, admin_token_a = register(client, email="companyA@example.com")
++    client.post(
++        "/api/documents/upload",
++        headers=auth_headers(admin_token_a),
++        files={"file": ("secret-plan.txt", b"Confidential company A roadmap.", "text/plain")},
++    )
++
++    _, _, admin_token_b = _create_tenant_with_admin(
++        db_session, "companyB@example.com", "Company B"
++    )
++
++    listed_b = client.get("/api/documents", headers=auth_headers(admin_token_b))
++    assert listed_b.status_code == 200
++    assert "secret-plan.txt" not in listed_b.json()["sources"]
++
++    # Tenant B also must not be able to delete tenant A's document by name.
++    delete_attempt = client.delete(
++        "/api/documents/secret-plan.txt", headers=auth_headers(admin_token_b)
++    )
++    assert delete_attempt.status_code == 404
++
++    # And tenant A should still see their own document, untouched.
++    listed_a = client.get("/api/documents", headers=auth_headers(admin_token_a))
++    assert "secret-plan.txt" in listed_a.json()["sources"]
++
++
++def test_tenant_b_image_upload_does_not_collide_with_tenant_a(client, db_session, tmp_path, monkeypatch):
++    """Regression test for the cross-tenant image-overwrite bug: two
++    tenants uploading a same-named image must not overwrite each other's
++    file on disk."""
++    import app.api.documents as documents_module
++
++    monkeypatch.setattr(documents_module, "IMAGES_DIR", str(tmp_path / "images"))
++    import os
++    os.makedirs(documents_module.IMAGES_DIR, exist_ok=True)
++
++    _, admin_token_a = register(client, email="companyA2@example.com")
++    _, _, admin_token_b = _create_tenant_with_admin(
++        db_session, "companyB2@example.com", "Company B2"
++    )
++
++    png_bytes = b"\x89PNG\r\n\x1a\nfake-but-nonempty-image-bytes"
++
++    resp_a = client.post(
++        "/api/documents/upload",
++        headers=auth_headers(admin_token_a),
++        files={"file": ("logo.png", png_bytes + b"-A", "image/png")},
++    )
++    resp_b = client.post(
++        "/api/documents/upload",
++        headers=auth_headers(admin_token_b),
++        files={"file": ("logo.png", png_bytes + b"-B", "image/png")},
++    )
++    assert resp_a.status_code == 200
++    assert resp_b.status_code == 200
++
++    # Both files should exist on disk simultaneously, under different
++    # tenant-prefixed names — neither should have overwritten the other.
++    saved_files = os.listdir(documents_module.IMAGES_DIR)
++    assert len(saved_files) == 2, (
++        f"expected 2 distinct on-disk files for tenant A and B's 'logo.png', "
++        f"got: {saved_files}"
++    )
