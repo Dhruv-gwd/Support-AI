@@ -63,9 +63,9 @@ def _remove_existing_document(filename: str, tenant_id: int, db: Session) -> Non
     the same filename replace it instead of duplicating chunks."""
     vector_store.delete_source(filename, tenant_id=tenant_id)
 
-    image_files = get_document_images(filename)
+    image_files = get_document_images(tenant_id, filename)
     cleanup_image_files(image_files)
-    remove_document_images(filename)
+    remove_document_images(tenant_id, filename)
 
     existing_docs = (
         db.query(Document)
@@ -115,19 +115,24 @@ async def upload_document(
     _remove_existing_document(original_filename, current_user.tenant_id, db)
 
     if is_image_only:
-        saved_name = original_filename
+        # Prefix the on-disk filename with the tenant id. Without this, two
+        # tenants uploading a same-named file (e.g. "logo.png") would write
+        # to the same physical path and silently overwrite each other's
+        # image on disk — a real cross-tenant data leak. The tenant-facing
+        # filename (in the Document row / UI) stays the clean original name.
+        saved_name = f"t{current_user.tenant_id}_{original_filename}"
         out_path = os.path.join(IMAGES_DIR, saved_name)
         with open(out_path, "wb") as f:
             f.write(content)
-        add_document_images(saved_name, [saved_name])
+        add_document_images(current_user.tenant_id, original_filename, [saved_name])
         doc = Document(
-            filename=saved_name,
+            filename=original_filename,
             tenant_id=current_user.tenant_id,
             uploaded_by=current_user.id,
         )
         db.add(doc)
         db.commit()
-        return UploadResponse(filename=saved_name, chunks_added=0)
+        return UploadResponse(filename=original_filename, chunks_added=0)
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp:
         tmp.write(content)
@@ -160,7 +165,7 @@ async def upload_document(
     vector_store.add_chunks(
         chunks, embeddings, original_filename, tenant_id=current_user.tenant_id
     )
-    add_document_images(original_filename, image_files)
+    add_document_images(current_user.tenant_id, original_filename, image_files)
 
     doc = Document(
         filename=original_filename,
@@ -210,9 +215,9 @@ def delete_document(
 
     deleted = vector_store.delete_source(filename, tenant_id=current_user.tenant_id)
 
-    image_files = get_document_images(filename)
+    image_files = get_document_images(current_user.tenant_id, filename)
     cleanup_image_files(image_files)
-    remove_document_images(filename)
+    remove_document_images(current_user.tenant_id, filename)
 
     docs = (
         db.query(Document)
@@ -230,10 +235,27 @@ def delete_document(
 
 
 @router.get("/images/{image_name}")
-def get_image(image_name: str, current_user=Depends(get_current_user)):
+def get_image(
+    image_name: str,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
     safe_name = os.path.basename(image_name)
-    tenant_sources = vector_store.list_sources(tenant_id=current_user.tenant_id)
-    if not any(safe_name in get_document_images(source) for source in tenant_sources):
+    # Permission check is based on the Document table, not the vector
+    # store: standalone image-only uploads never get vector chunks, so
+    # vector_store.list_sources() would never include them and this
+    # endpoint would 404 on every standalone image. The Document table
+    # covers both standalone images and images extracted from text docs.
+    tenant_doc_filenames = [
+        d.filename
+        for d in db.query(Document)
+        .filter(Document.tenant_id == current_user.tenant_id)
+        .all()
+    ]
+    if not any(
+        safe_name in get_document_images(current_user.tenant_id, fname)
+        for fname in tenant_doc_filenames
+    ):
         raise HTTPException(status_code=404, detail="Image not found")
     image_path = os.path.join(IMAGES_DIR, safe_name)
     if not os.path.exists(image_path):

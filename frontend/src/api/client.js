@@ -83,3 +83,13 @@ export const deleteConversation = async (conversationId) => {
   const { data } = await api.delete(`/auth/conversations/${conversationId}`);
   return data;
 };
+
+export const listUsers = async () => {
+  const { data } = await api.get("/admin/users");
+  return data;
+};
+
+export const getAdminSettings = async () => {
+  const { data } = await api.get("/admin/settings");
+  return data;
+};

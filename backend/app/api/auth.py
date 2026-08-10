@@ -23,7 +23,13 @@ from app.services.auth_service import (
     create_access_token,
     decode_access_token,
 )
-from app.config import SECRET_KEY, ALGORITHM, RATE_LIMIT_PER_MINUTE
+from app.config import (
+    SECRET_KEY,
+    ALGORITHM,
+    RATE_LIMIT_PER_MINUTE,
+    MAX_FILE_SIZE_MB,
+    ACCESS_TOKEN_EXPIRE_MINUTES,
+)
 from app.limiter import limiter
 
 router = APIRouter()
@@ -93,19 +99,25 @@ def register(request: Request, user_in: UserCreate, db: Session = Depends(get_db
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
 
-    tenant = Tenant(
-        name=user_in.full_name or "Default", slug=user_in.email.split("@")[0]
-    )
-    db.add(tenant)
-    db.flush()
-
-    # The first user registered into a tenant becomes that tenant's admin.
-    # Without this, a fresh signup has no route to the admin panel at all —
-    # promotion currently requires shell access to run make_admin.py.
-    existing_users_in_tenant = (
-        db.query(User).filter(User.tenant_id == tenant.id).count()
-    )
-    role = "admin" if existing_users_in_tenant == 0 else "user"
+    # This deployment is single-tenant by design: one Docker deployment is
+    # meant to serve one company (see CLIENT_SETUP.md — each client gets
+    # their own instance copied to their own machine). So there should be
+    # exactly one workspace total, not a fresh one per signup. The very
+    # first person to ever register on a brand-new deployment is the
+    # company setting this up: they create that one workspace and become
+    # its admin. Everyone who registers after that (their employees /
+    # end-users) joins the SAME workspace as a plain "user" with no admin
+    # access — they must never get their own tenant or auto-promotion.
+    tenant = db.query(Tenant).first()
+    if tenant is None:
+        tenant = Tenant(
+            name=user_in.full_name or "Default", slug=user_in.email.split("@")[0]
+        )
+        db.add(tenant)
+        db.flush()
+        role = "admin"
+    else:
+        role = "user"
 
     user = User(
         email=user_in.email,
@@ -219,6 +231,22 @@ def list_users(
     db: Session = Depends(get_db), current_user: User = Depends(require_admin)
 ):
     return db.query(User).filter(User.tenant_id == current_user.tenant_id).all()
+
+
+@router.get("/admin/settings", response_model=dict)
+def get_settings(current_user: User = Depends(require_admin)):
+    # Read-only view of the settings that actually govern this deployment.
+    # These are set via environment variables at deploy time (see
+    # CLIENT_SETUP.md) rather than editable here, so this intentionally
+    # does not expose a PUT/PATCH — showing a live value beats showing
+    # a "Save" button wired to nothing.
+    return {
+        "tenant_name": current_user.tenant.name,
+        "tenant_slug": current_user.tenant.slug,
+        "rate_limit_per_minute": RATE_LIMIT_PER_MINUTE,
+        "max_file_size_mb": MAX_FILE_SIZE_MB,
+        "access_token_expire_minutes": ACCESS_TOKEN_EXPIRE_MINUTES,
+    }
 
 
 @router.get("/admin/documents", response_model=list[dict])
